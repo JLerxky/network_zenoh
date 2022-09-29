@@ -5,9 +5,9 @@ authors = ["Rivtower Technologies <contact@rivtower.com>"]
 edition = "2021"
 
 [dependencies]
-zenoh = { git = "https://github.com/cita-cloud/zenoh.git" }
+zenoh = { git = "https://github.com/eclipse-zenoh/zenoh.git" }
 flume = "0.10"
-tokio = { version = "1.20", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1.21", features = ["rt-multi-thread", "time"] }
 tokio-util = "0.7"
 parking_lot = "0.12"
 toml = "0.5"
@@ -24,7 +24,7 @@ md5 = "0.7"
 json5 = "0.4"
 tonic = "0.7"
 prost = "0.10"
-tower = "0.4.13"
+tower = "0.4"
 
 cloud-util = { git = "https://github.com/cita-cloud/cloud-util.git" }
 cita_cloud_proto = { git = "https://github.com/cita-cloud/cita_cloud_proto.git" }
