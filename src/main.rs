@@ -17,10 +17,12 @@ mod dispatcher;
 mod grpc_server;
 mod health_check;
 mod hot_update;
-mod panic_hook;
 mod peer;
 mod server;
 mod util;
+
+#[macro_use]
+extern crate tracing as logger;
 
 use crate::{
     config::NetworkConfig, dispatcher::NetworkMsgDispatcher,
@@ -33,12 +35,12 @@ use cita_cloud_proto::{
 };
 use clap::Parser;
 use cloud_util::metrics::{run_metrics_exporter, MiddlewareLayer};
+use cloud_util::panic_hook::set_panic_handler;
 use cloud_util::unix_now;
 use flume::unbounded;
-use log::info;
-use panic_hook::set_panic_handler;
 use parking_lot::RwLock;
 use std::{collections::HashMap, sync::Arc};
+use util::clap_about;
 
 const CLIENT_NAME: &str = "network";
 
@@ -58,7 +60,7 @@ fn main() {
 /// This doc string acts as a help message when the user runs '--help'
 /// as do all doc strings on fields
 #[derive(Parser)]
-#[clap(version, author)]
+#[clap(version, about = clap_about())]
 struct Opts {
     #[clap(subcommand)]
     subcmd: SubCommand,
@@ -77,22 +79,20 @@ struct RunOpts {
     /// Chain config path
     #[clap(short = 'c', long = "config", default_value = "config.toml")]
     config_path: String,
-    /// log config path
-    #[clap(short = 'l', long = "log", default_value = "network-log4rs.yaml")]
-    log_file: String,
 }
 
 async fn run(opts: RunOpts) {
     ::std::env::set_var("RUST_BACKTRACE", "full");
 
+    #[cfg(not(windows))]
     tokio::spawn(cloud_util::signal::handle_signals());
 
     // read config.toml
     let config = NetworkConfig::new(&opts.config_path);
 
-    // init log4rs
-    log4rs::init_file(&opts.log_file, Default::default())
-        .map_err(|e| println!("log init err: {}", e))
+    // init tracer
+    cloud_util::tracer::init_tracer(config.domain.clone(), &config.log_config)
+        .map_err(|e| println!("tracer init err: {e}"))
         .unwrap();
 
     let grpc_port = config.grpc_port.to_string();
@@ -133,7 +133,7 @@ async fn run(opts: RunOpts) {
     // knownpeers
     let mut peers_map = HashMap::new();
     for peer in &config.peers {
-        peers_map.insert(peer.domain.to_string(), peer.clone());
+        peers_map.insert(peer.domain.to_string(), (0, peer.clone()));
     }
 
     let peers = Arc::new(RwLock::new(PeersManger::new(peers_map)));
@@ -147,7 +147,7 @@ async fn run(opts: RunOpts) {
         chain_origin: config.get_chain_origin(),
     };
     let network_svc_hot_update = network_svc.clone();
-    let grpc_addr = format!("0.0.0.0:{}", grpc_port).parse().unwrap();
+    let grpc_addr = format!("0.0.0.0:{grpc_port}").parse().unwrap();
     let peers_for_health_check = peers.clone();
 
     // add layer if metrics is enabled
@@ -171,7 +171,9 @@ async fn run(opts: RunOpts) {
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .layer(layer.unwrap())
-                .add_service(NetworkServiceServer::new(network_svc))
+                .add_service(
+                    NetworkServiceServer::new(network_svc).max_decoding_message_size(usize::MAX),
+                )
                 .add_service(HealthServer::new(HealthCheckServer::new(
                     peers_for_health_check,
                     send_msg_check,
@@ -185,7 +187,9 @@ async fn run(opts: RunOpts) {
         info!("metrics off");
         tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(NetworkServiceServer::new(network_svc))
+                .add_service(
+                    NetworkServiceServer::new(network_svc).max_decoding_message_size(usize::MAX),
+                )
                 .add_service(HealthServer::new(HealthCheckServer::new(
                     peers_for_health_check,
                     send_msg_check,

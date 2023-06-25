@@ -14,29 +14,31 @@
 
 use std::collections::{HashMap, HashSet};
 
-use log::debug;
-
 use crate::config::PeerConfig;
 
 #[derive(Debug)]
 pub struct PeersManger {
-    known_peers: HashMap<String, PeerConfig>,
+    known_peers: HashMap<String, (u64, PeerConfig)>,
     connected_peers: HashSet<String>,
 }
 
 impl PeersManger {
-    pub fn new(known_peers: HashMap<String, PeerConfig>) -> Self {
+    pub fn new(known_peers: HashMap<String, (u64, PeerConfig)>) -> Self {
         Self {
             known_peers,
             connected_peers: HashSet::new(),
         }
     }
 
-    pub fn get_known_peers(&self) -> &HashMap<String, PeerConfig> {
+    pub fn get_known_peers(&self) -> &HashMap<String, (u64, PeerConfig)> {
         &self.known_peers
     }
 
-    pub fn add_known_peers(&mut self, domain: String, peer: PeerConfig) -> Option<PeerConfig> {
+    pub fn add_known_peers(
+        &mut self,
+        domain: String,
+        peer: (u64, PeerConfig),
+    ) -> Option<(u64, PeerConfig)> {
         debug!("add_from_config_peers: {}", domain);
         self.known_peers.insert(domain, peer)
     }
@@ -45,11 +47,14 @@ impl PeersManger {
         &self.connected_peers
     }
 
-    pub fn set_connected_peers(&mut self, peers: HashSet<String>) {
-        self.connected_peers = peers;
+    pub fn add_connected_peer(&mut self, domain: &str, origin: u64) {
+        if let Some((addr, _)) = self.known_peers.get_mut(domain) {
+            *addr = origin;
+            self.connected_peers.insert(domain.to_owned());
+        }
     }
 
-    fn delete_connected_peers(&mut self, domain: &str) {
+    pub fn delete_connected_peer(&mut self, domain: &str) {
         if self.connected_peers.get(domain).is_some() {
             debug!("delete_connected_peers: {}", domain);
             self.connected_peers.remove(domain);
@@ -60,7 +65,7 @@ impl PeersManger {
         if self.known_peers.contains_key(domain) {
             debug!("delete_peer: {}", domain);
             self.known_peers.remove(domain);
-            self.delete_connected_peers(domain);
+            self.delete_connected_peer(domain);
         }
     }
 }

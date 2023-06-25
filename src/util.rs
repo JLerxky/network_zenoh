@@ -32,6 +32,18 @@ pub fn write_to_file(content: &[u8], path: impl AsRef<path::Path>) {
     file.flush().unwrap();
 }
 
+pub fn build_multiaddr(host: &str, port: u16, domain: &str) -> String {
+    // TODO: default to return Dns4 for host, consider if it' appropriate
+    vec![
+        Protocol::Dns4(host.into()),
+        Protocol::Tcp(port),
+        Protocol::Tls(domain.into()),
+    ]
+    .into_iter()
+    .collect::<MultiAddr>()
+    .to_string()
+}
+
 pub fn parse_multiaddr(s: &str) -> Option<(String, u16, String)> {
     let multiaddr = s.parse::<MultiAddr>().ok()?;
 
@@ -82,4 +94,11 @@ pub fn to_u64(tmp: &str) -> u64 {
     let mut decoded = [0; 8];
     hex::decode_to_slice(tmp, &mut decoded).unwrap();
     u64::from_be_bytes(decoded)
+}
+
+pub fn clap_about() -> String {
+    let name = env!("CARGO_PKG_NAME").to_string();
+    let version = env!("CARGO_PKG_VERSION");
+    let authors = env!("CARGO_PKG_AUTHORS");
+    name + " " + version + "\n" + authors
 }

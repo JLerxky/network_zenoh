@@ -12,19 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashSet, str::FromStr, sync::Arc};
-
 use bytes::BytesMut;
-use cita_cloud_proto::network::NetworkMsg;
-use log::{debug, error, info, warn};
 use parking_lot::RwLock;
 use prost::Message;
 use r#async::AsyncResolve;
+use std::{str::FromStr, sync::Arc, time::Duration};
+use tokio::time::interval;
+use zenoh::{config::QoSConf, prelude::*};
+use zenoh_ext::SubscriberBuilderExt;
+
+use cita_cloud_proto::network::NetworkMsg;
 use util::write_to_file;
-use zenoh::{
-    config::{EndPoint, QoSConf},
-    prelude::*,
-};
 
 use crate::{
     config::NetworkConfig,
@@ -45,10 +43,10 @@ pub async fn zenoh_serve(
     // Peer instance mode
     let mut zenoh_config = zenoh::prelude::config::peer();
 
-    // Set the chain_id to the zenoh instance id
-    zenoh_config
-        .set_id(ZenohId::from_str(&config.node_address).unwrap())
-        .unwrap();
+    // Use rand ZenohId
+    let zid = ZenohId::default();
+    info!("ZenohId: {zid}");
+    zenoh_config.set_id(zid).unwrap();
 
     zenoh_config
         .scouting
@@ -90,6 +88,13 @@ pub async fn zenoh_serve(
         .link
         .rx
         .set_buffer_size(Some(config.rx_buffer_size))
+        .unwrap();
+
+    // Maximum number of unicast incoming links per transport session
+    zenoh_config
+        .transport
+        .unicast
+        .set_max_links(Some(4))
         .unwrap();
 
     // the shared-memory transport will be disabled.
@@ -145,10 +150,13 @@ pub async fn zenoh_serve(
     // open zenoh session
     let session = zenoh::open(zenoh_config).res().await.unwrap();
 
+    let self_node_origin = config.get_node_origin();
+    let self_validator_origin = config.get_validator_origin();
+
     // node subscriber
     let inbound_msg_tx = network_svc.inbound_msg_tx.clone();
     let _node_subscriber = session
-        .declare_subscriber(config.get_node_origin().to_string())
+        .declare_subscriber(self_node_origin.to_string())
         .callback(move |sample| {
             let msg = NetworkMsg::decode(&*sample.value.payload.contiguous())
                 .map_err(|e| error!("{e}"))
@@ -169,8 +177,10 @@ pub async fn zenoh_serve(
             let msg = NetworkMsg::decode(&*sample.value.payload.contiguous())
                 .map_err(|e| error!("{e}"))
                 .unwrap();
-            debug!("inbound msg chain: {:?}", &msg);
-            inbound_msg_tx.send(msg).map_err(|e| error!("{e}")).unwrap();
+            if msg.origin != self_node_origin {
+                debug!("inbound msg chain: {:?}", &msg);
+                inbound_msg_tx.send(msg).map_err(|e| error!("{e}")).unwrap();
+            }
         })
         .best_effort()
         .res()
@@ -179,17 +189,19 @@ pub async fn zenoh_serve(
 
     // When the controller (node) address is the same as the consensus address, simply subscribe to the controller (node) address
     let _validator_subscriber;
-    if config.get_node_origin() != config.get_validator_origin() {
+    if self_node_origin != self_validator_origin {
         debug!("------ (node_origin != validator_origin)");
         let inbound_msg_tx = network_svc.inbound_msg_tx.clone();
         _validator_subscriber = session
-            .declare_subscriber(config.get_validator_origin().to_string())
+            .declare_subscriber(self_validator_origin.to_string())
             .callback(move |sample| {
                 let msg = NetworkMsg::decode(&*sample.value.payload.contiguous())
                     .map_err(|e| error!("{e}"))
                     .unwrap();
-                debug!("inbound msg validator: {:?}", &msg);
-                inbound_msg_tx.send(msg).map_err(|e| error!("{e}")).unwrap();
+                if msg.origin != self_node_origin {
+                    debug!("inbound msg validator: {:?}", &msg);
+                    inbound_msg_tx.send(msg).map_err(|e| error!("{e}")).unwrap();
+                }
             })
             .best_effort()
             .res()
@@ -197,31 +209,50 @@ pub async fn zenoh_serve(
             .unwrap();
     }
 
-    // send_msg_check subscriber
-    let outbound_msg_tx = network_svc.outbound_msg_tx.clone();
-    let _check_forward_subscriber = session
-        .declare_subscriber(format!("{}-check", config.get_chain_origin()))
-        .callback(move |sample| {
-            let mut msg = NetworkMsg::decode(&*sample.value.payload.contiguous())
-                .map_err(|e| error!("{e}"))
-                .unwrap();
-            msg.origin = u64::from_be_bytes(msg.msg[..8].try_into().unwrap());
-            let _ = outbound_msg_tx.send(msg);
-        })
-        .best_effort()
+    // liveliness declaring
+    let liveliness_prefix = format!("chain-id:{}/", config.get_chain_origin());
+    let _liveliness_token = session
+        .liveliness()
+        .declare_token(&format!(
+            "{}{}@{}",
+            liveliness_prefix, config.domain, self_node_origin
+        ))
         .res()
         .await
         .unwrap();
 
-    let mut config_md5 = calculate_md5(&config_path).unwrap();
+    // liveliness subscriber
+    let peers_to_update = peers.clone();
+    let _liveliness_subscriber = session
+        .liveliness()
+        .declare_subscriber(format!("{}**", liveliness_prefix))
+        .querying()
+        .callback(move |sample| {
+            if let Some(key_expr) = sample.key_expr.as_str().strip_prefix(&liveliness_prefix) {
+                if let Some((domain, origin)) = key_expr.split_once('@') {
+                    if let Ok(origin) = u64::from_str(origin) {
+                        match sample.kind {
+                            SampleKind::Put => {
+                                info!("Peer connected, new alive token ({} - {})", domain, origin);
+                                peers_to_update.write().add_connected_peer(domain, origin);
+                            }
+                            SampleKind::Delete => {
+                                info!("Peer offline, dropped token ({} - {})", domain, origin);
+                                peers_to_update.write().delete_connected_peer(domain);
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .res()
+        .await
+        .unwrap();
+
+    let mut config_md5 = calculate_md5(config_path).unwrap();
     debug!("config file initial md5: {:x}", config_md5);
 
-    let mut hot_update_interval =
-        tokio::time::interval(tokio::time::Duration::from_secs(config.hot_update_interval));
-
-    let mut health_check_interval = tokio::time::interval(tokio::time::Duration::from_secs(
-        config.health_check_interval,
-    ));
+    let mut hot_update_interval = interval(Duration::from_secs(config.hot_update_interval));
 
     loop {
         tokio::select! {
@@ -245,7 +276,11 @@ pub async fn zenoh_serve(
                         .res()
                         .await
                         .unwrap();
-                    msg.origin = config.get_node_origin();
+                    msg.origin = if "consensus".eq(&msg.module) {
+                        self_validator_origin
+                    } else {
+                        self_node_origin
+                    };
                     let mut dst = BytesMut::new();
                     msg.encode(&mut dst).unwrap();
                     publisher
@@ -258,7 +293,7 @@ pub async fn zenoh_serve(
             },
             // hot update
             _ = hot_update_interval.tick() => {
-                if let Ok(new_md5) = calculate_md5(&config_path) {
+                if let Ok(new_md5) = calculate_md5(config_path) {
                     if new_md5 != config_md5 {
                         info!("config file new md5: {:x}", new_md5);
                         config_md5 = new_md5;
@@ -267,49 +302,6 @@ pub async fn zenoh_serve(
                 } else {
                     warn!("calculate config file md5 failed, make sure it's not removed");
                 };
-            },
-            // health check
-            _ = health_check_interval.tick() => {
-                // update connected peers
-                let endpoints: Vec<EndPoint> = session
-                    .config()
-                    .get("connect/endpoints")
-                    .map_err(|e| error!("{e}"))
-                    .unwrap()
-                    .downcast_ref::<Vec<EndPoint>>()
-                    .unwrap()
-                    .to_vec();
-                debug!("{:?}", endpoints);
-                let mut connected_peers = HashSet::new();
-                for endpoint in endpoints {
-                    connected_peers.insert(endpoint.locator.address().to_string());
-                }
-                {
-                    let mut peers = peers.write();
-                    peers.set_connected_peers(connected_peers);
-                }
-
-                // send msg check
-                let msg = NetworkMsg {
-                    module: "HEALTH_CHECK".to_string(),
-                    r#type: "HEALTH_CHECK".to_string(),
-                    origin: config.get_node_origin(),
-                    msg: config.get_node_origin().to_be_bytes().to_vec()
-                };
-                let publisher = session
-                    .declare_publisher(format!("{}-check", config.get_chain_origin()))
-                    .congestion_control(zenoh::publication::CongestionControl::Block)
-                    .priority(Priority::DataHigh)
-                    .res()
-                    .await
-                    .unwrap();
-                let mut dst = BytesMut::new();
-                msg.encode(&mut dst).unwrap();
-                publisher
-                    .put(&*dst)
-                    .res()
-                    .await
-                    .unwrap();
             },
             else => {
                 debug!("network stopped!");

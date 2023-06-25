@@ -19,8 +19,8 @@ use cita_cloud_proto::network::{
     network_service_server::NetworkService, NetworkMsg, NetworkStatusResponse, RegisterInfo,
 };
 use cita_cloud_proto::retry::RetryClient;
+use cita_cloud_proto::status_code::StatusCodeEnum;
 use flume::Sender;
-use log::{debug, error, info, warn};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,7 +28,7 @@ use tonic::{Request, Response, Status};
 
 use crate::config::PeerConfig;
 use crate::peer::PeersManger;
-use crate::util::parse_multiaddr;
+use crate::util::{build_multiaddr, parse_multiaddr};
 
 #[derive(Clone)]
 pub struct CitaCloudNetworkServiceServer {
@@ -42,10 +42,13 @@ pub struct CitaCloudNetworkServiceServer {
 
 #[tonic::async_trait]
 impl NetworkService for CitaCloudNetworkServiceServer {
+    #[instrument(skip_all)]
     async fn send_msg(
         &self,
         request: Request<NetworkMsg>,
     ) -> Result<Response<StatusCode>, tonic::Status> {
+        cloud_util::tracer::set_parent(&request);
+
         let msg = request.into_inner();
         debug!("send_msg: {:?}", &msg);
         let _ = self
@@ -53,13 +56,16 @@ impl NetworkService for CitaCloudNetworkServiceServer {
             .send_async(msg)
             .await
             .map_err(|e| error!("{e}"));
-        Ok(Response::new(status_code::StatusCode::Success.into()))
+        Ok(Response::new(StatusCodeEnum::Success.into()))
     }
 
+    #[instrument(skip_all)]
     async fn broadcast(
         &self,
         request: Request<NetworkMsg>,
     ) -> Result<Response<StatusCode>, tonic::Status> {
+        cloud_util::tracer::set_parent(&request);
+
         let mut msg = request.into_inner();
         debug!("broadcast: {:?}", &msg);
         msg.origin = self.chain_origin;
@@ -69,13 +75,17 @@ impl NetworkService for CitaCloudNetworkServiceServer {
             .await
             .map_err(|e| error!("{e}"));
 
-        Ok(Response::new(status_code::StatusCode::Success.into()))
+        Ok(Response::new(StatusCodeEnum::Success.into()))
     }
 
+    #[instrument(skip_all)]
     async fn get_network_status(
         &self,
-        _request: Request<Empty>,
+        request: Request<Empty>,
     ) -> Result<Response<NetworkStatusResponse>, tonic::Status> {
+        cloud_util::tracer::set_parent(&request);
+        debug!("get_network_status request: {:?}", request);
+
         let reply = NetworkStatusResponse {
             peer_count: self.peers.read().get_connected_peers().len() as u64,
         };
@@ -83,17 +93,25 @@ impl NetworkService for CitaCloudNetworkServiceServer {
         Ok(Response::new(reply))
     }
 
+    #[instrument(skip_all)]
     async fn register_network_msg_handler(
         &self,
-        _request: Request<RegisterInfo>,
+        request: Request<RegisterInfo>,
     ) -> Result<Response<StatusCode>, tonic::Status> {
-        Ok(Response::new(status_code::StatusCode::Success.into()))
+        cloud_util::tracer::set_parent(&request);
+        debug!("register_network_msg_handler request: {:?}", request);
+
+        Ok(Response::new(StatusCodeEnum::Success.into()))
     }
 
+    #[instrument(skip_all)]
     async fn add_node(
         &self,
         request: Request<NodeNetInfo>,
     ) -> Result<Response<StatusCode>, tonic::Status> {
+        cloud_util::tracer::set_parent(&request);
+        debug!("add_node request: {:?}", request);
+
         let node_net_info = request.into_inner();
         let multiaddr = node_net_info.multi_address;
 
@@ -102,59 +120,64 @@ impl NetworkService for CitaCloudNetworkServiceServer {
                 "parse_multiaddr: not a valid tls multi-address: {}",
                 &multiaddr
             );
-            Status::invalid_argument(status_code::StatusCode::MultiAddrParseError.to_string())
+            Status::invalid_argument(StatusCodeEnum::MultiAddrParseError.to_string())
         })?;
 
-        let address = format!("quic/{}:{}", domain, port);
+        let address = format!("quic/{domain}:{port}");
 
         let endpoint: zenoh::prelude::config::EndPoint = address.parse().map_err(|_| {
             warn!("parse_addr: not a valid address: {}", address);
-            Status::invalid_argument(status_code::StatusCode::MultiAddrParseError.to_string())
+            Status::invalid_argument(StatusCodeEnum::MultiAddrParseError.to_string())
         })?;
 
-        let address = endpoint.locator.address();
+        let address = endpoint.address();
         info!("attempt to add new peer: {}", &address);
 
         {
             let mut peers = self.peers.write();
+
             if peers.get_connected_peers().contains(&domain) {
                 //add a connected peer
-                return Ok(Response::new(
-                    status_code::StatusCode::AddExistedPeer.into(),
-                ));
+                return Ok(Response::new(StatusCodeEnum::AddExistedPeer.into()));
             }
             if peers.get_known_peers().contains_key(&domain) {
                 //add a known peer which is already trying to connect, return success
-                return Ok(Response::new(status_code::StatusCode::Success.into()));
+                return Ok(Response::new(StatusCodeEnum::Success.into()));
             }
 
             let peer = PeerConfig {
-                protocol: endpoint.locator.protocol().to_string(),
+                protocol: endpoint.protocol().to_string(),
                 domain: domain.to_string(),
                 port,
             };
 
-            peers.add_known_peers(domain, peer);
+            peers.add_known_peers(domain, (0, peer));
         }
         info!("peer added: {}", &address);
 
-        Ok(Response::new(status_code::StatusCode::Success.into()))
+        Ok(Response::new(StatusCodeEnum::Success.into()))
     }
 
+    #[instrument(skip_all)]
     async fn get_peers_net_info(
         &self,
-        _request: Request<Empty>,
+        request: Request<Empty>,
     ) -> Result<Response<TotalNodeNetInfo>, tonic::Status> {
+        cloud_util::tracer::set_parent(&request);
+        debug!("get_peers_net_info request: {:?}", request);
+
         let mut node_infos: Vec<NodeNetInfo> = vec![];
         let peers;
         {
             peers = self.peers.read().get_connected_peers().clone();
         }
-        for addr in peers.iter() {
-            node_infos.push(NodeNetInfo {
-                multi_address: addr.to_string(),
-                origin: 0,
-            });
+        for domain in peers.iter() {
+            if let Some((origin, peer_config)) = self.peers.read().get_known_peers().get(domain) {
+                node_infos.push(NodeNetInfo {
+                    multi_address: build_multiaddr("127.0.0.1", peer_config.port, domain),
+                    origin: *origin,
+                });
+            }
         }
 
         Ok(Response::new(TotalNodeNetInfo { nodes: node_infos }))
